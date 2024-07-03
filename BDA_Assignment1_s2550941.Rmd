@@ -1,0 +1,667 @@
+---
+title: "BDA Assignment 1"
+author: "Hrushikesh Vazurkar"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+library(knitr)
+knitr::opts_chunk$set(echo = TRUE)
+rm(list = ls(all = TRUE)) #Clears all variables to ensure reproducibility.
+```
+
+## Understanding the paper titled, "Optimal State Estimation of Spinning Ping-Pong Ball Using Continuous Motion Model” by Zhao et al, to model the motion of ping-pong ball(JAGS) and answer questions given in the assignment.
+
+## Question 1 - DAG Representation of the model (as per Euler-Mayurama discretisation of the original acceleration ODE)
+
+The aim of the assignment is to model the movements of a ping-pong ball following the Euler-Mayurama discretisation , including sampling, prediction, posterior predictive checks and experiment with alternative discretisation methods.
+
+### Question 1(a) - DAG Representation of the discretised model
+
+![DAG Representation of Ping-pong ball Euler-Mayurama Discretised Model](./model_dag.png)
+
+### Question 1(b) - Choice of priors for precision(tau) and angular velocity(omega or w) values with reasoning.
+
+-Include the equation for prior distributions with hyperparameters for precision and angular velocity, with reasoning for each.
+
+Answer 1(b) - For the choice of priors:
+
+tau_pos, tau_vel, tau_o_pos, tau_o_vel - I have chosen Gamma distribution with alpha=1 and beta=0.5 for modelling the precision in the position of the ping-pong ball. Gamma distribution is conjugate prior for normal posterior, and also it flexible distribution which enables modelling various levels of uncertainty without being rigid in the shape.
+
+wx, wy, wz (Angular velocities) - As angular velocity can be both positive and negative (based on the direction), I surmised that a symmetric prior should be appropriate to model the uncertainty in angular velocities.
+
+## Question 2 - Given the "Table Tennis Ball Trajectories with Spin - Edmond(mpg.de)" dataset, implement the given Euler-Mayurama discretised ODE model for ping-pong ball trajectory.
+
+Through this question, I write the specification of Model 1 as per the assignment pdf, sample stochastic variables from the model, perform basic statistical tests like Gelman-Rubin, Summary etc, and plot the posterior angular velocity values. Here, I prefer using JAGS to implement the model.
+
+The below code block loads the dataset for 60 values of position, velocity and time steps.
+
+```{r load dataset + read values for Position and Velocity (vectors), and Time Steps, include=FALSE}
+library(rhdf5) #To read hdf5 file format
+
+n=60; # time steps for ping-pong ball trajectory
+niter=100000; # Number of Monte Carlo iterations
+ndiscard = 1000;
+
+# Position data (vectors - x,y and z coordinate)
+xyz.obs<-h5read("MN5008_grid_data_equal_speeds.hdf5","/originals/405/positions")[,2:(n+1)]; 
+xo=xyz.obs[1,]; yo=xyz.obs[2,]; zo=xyz.obs[3,];
+
+# Velocity data (vectors - x,y and z coordinate)
+vxvyvz.obs<-h5read("MN5008_grid_data_equal_speeds.hdf5","/originals/405/velocities")[,2:(n+1)];
+vxo<-vxvyvz.obs[1,];vyo=vxvyvz.obs[2,];vzo=vxvyvz.obs[3,];
+
+# Time Step values
+timeSteps <-h5read("MN5008_grid_data_equal_speeds.hdf5","/originals/405/time_stamps")[2:(n+1)];
+```
+
+The below code block specifies the specifications for the Euler-Mayurama discretisation for ping-pong ball (as represented in the assignment)
+
+Step1: Model String -> Specifying the priors for position, velocity and precision.
+Step2: Model String -> Defining the likelihood parameters for positions and velocities in next time steps
+Step3: Model String -> Defining the observation model so that JAGS can learn from the observation data (position and velocities).
+
+```{r Model 1: Model specification for Euler-Mayurama discretisation for ping-pong ball(in JAGS)}
+library(rjags)
+library(coda)
+
+# Define the model string
+model_string <- "
+model {
+  # Given priors for position and velocity
+  x[1] ~ dnorm(0,1)
+  y[1] ~ dnorm(0,1)
+  z[1] ~ dnorm(0,1)
+  vx[1] ~ dnorm(0,25)
+  vy[1] ~ dnorm(0,25)
+  vz[1] ~ dnorm(0,25)
+  
+  # Custom Priors for precision and angular velocity
+  tau_pos ~ dgamma(1,0.5)
+  tau_vel ~ dgamma(1,0.5)
+  tau_o_pos ~ dgamma(1,0.5)
+  tau_o_vel ~ dgamma(1,0.5)
+  wx ~ dnorm(0,100)
+  wy ~ dnorm(0,100)
+  wz ~ dnorm(0,100)
+
+  # Likelihood for the position and velocity values in next time step
+  for (k in 1:(n-1)) {
+    vnorm[k] <- sqrt(vx[k]^2 + vy[k]^2 + vz[k]^2)
+
+    x[k+1] ~ dnorm(x[k] + (vx[k] * delta[k]), tau_pos)  # Euler-Mayurama for x-coordinate
+    y[k+1] ~ dnorm(y[k] + (vy[k] * delta[k]), tau_pos)  # Euler-Mayurama for y-coordinate
+    z[k+1] ~ dnorm(z[k] + (vz[k] * delta[k]), tau_pos)  # Euler-Mayurama for z-coordinate
+    
+    vx[k+1] ~ dnorm(vx[k] + (kd * vnorm[k] * vx[k] + km * (wy * vz[k] - wz * vy[k])) * delta[k], tau_vel)  #Euler-Mayurama for vx
+    vy[k+1] ~ dnorm(vy[k] + (kd * vnorm[k] * vy[k] + km * (wz * vx[k] - wx * vz[k])) * delta[k], tau_vel)  #Euler-Mayurama for vy
+    vz[k+1] ~ dnorm(vz[k] + (kd * vnorm[k] * vz[k] + km * (wx * vy[k] - wy * vx[k])) * delta[k] - g * delta[k], tau_vel)  # Euler-Mayurama for vz
+    
+    # Variables to be used for posterior predictive(replicate) checks
+    xrep[k+1] ~ dnorm(x[k] + (vx[k] * delta[k]), tau_pos)  
+    yrep[k+1] ~ dnorm(y[k] + (vy[k] * delta[k]), tau_pos)  
+    zrep[k+1] ~ dnorm(z[k] + (vz[k] * delta[k]), tau_pos) 
+    
+    vxrep[k+1] ~ dnorm(vx[k] + (-kd * vnorm[k] * vx[k] + km * (wy * vz[k] - wz * vy[k])) * delta[k], tau_vel) 
+    vyrep[k+1] ~ dnorm(vy[k] + (-kd * vnorm[k] * vy[k] + km * (wz * vx[k] - wx * vz[k])) * delta[k], tau_vel)  
+    vzrep[k+1] ~ dnorm(vz[k] + (-kd * vnorm[k] * vz[k] + km * (wx * vy[k] - wy * vx[k])) * delta[k] - g * delta[k], tau_vel)
+  }
+  
+  # Observation Model - use the observation data for posterior modelling
+  for(k in 1:(n-1)){
+    xo[k] ~ dnorm(x[k],tau_o_pos)
+    yo[k] ~ dnorm(y[k],tau_o_pos)
+    zo[k] ~ dnorm(z[k],tau_o_pos)
+    vxo[k] ~ dnorm(vx[k],tau_o_vel)
+    vyo[k] ~ dnorm(vy[k],tau_o_vel)
+    vzo[k] ~ dnorm(vz[k],tau_o_vel)
+  }
+}
+"
+```
+
+This code block performs sampling for the precision and angular velocity variables from the above specified models.
+
+Step1: model stores the MCMC model (through JAGS) as per Model 1 specification. 
+Step2: model_samples stores the values for precision and angular velocity variables, for further diagnosis.
+
+```{r Model 1: Sampling to get insights about tau and angular velocity(w)}
+model <- jags.model(textConnection(model_string), data = list(
+  n=n,
+  xo=xo,
+  yo=yo,
+  zo=zo,
+  vxo=vxo,
+  vyo=vyo,
+  vzo=vzo,
+  delta = diff(timeSteps), #difference between consecutive times to get the time steps (as per formula)
+  g=9.81, # given in the assignment pdf
+  km=1/(2*0.0027)*1*1.29*0.001256*0.02, #calculated from the given table in assignment pdf
+  kd=-1/(2*0.0027)*0.456*1.29*0.001256 #calculated from the given table in assignment pdf
+), n.chains = 4)
+
+update(model, ndiscard) # discard 'ndiscard' number of burn-in samples 
+
+model_samples <- coda.samples(model, variable.names = c('tau_pos', 'tau_vel', 'tau_o_pos', 'tau_o_vel', 'wx', 'wy', 'wz'), n.iter = niter) #sampling with 'niter' number of iterations
+```
+The below code block shows the Gelman-Rubin diagnostics for sampling done for precision and angular velocity variables for Model 1. Gelman-Rubin diagnostics is necessary to compare the intrachain variance and variance between multiple chains, and determine if further iterations are needed to rectify lack of convergence.
+
+Checking the plots of the Gelman-Rubin diagnostics for the precision and angular velocity variables below, it can be observed that the values converge to 1 for every variable under consideration, demonstrating convergence.
+
+```{r Model 1: Gelman-Rubin Diagnostics }
+gelman.plot(model_samples)
+```
+The below code block shows the effective sample sizes for precision and angular velocity variables from the Model 1 sampling.
+
+```{r Effective Sample Size for the stochastic variables inferred from Model 1 }
+cat("The effective size for tau_pos is",effectiveSize(model_samples[[1]][,"tau_pos"]),'\n')
+cat("The effective size for tau_vel is",effectiveSize(model_samples[[1]][,"tau_vel"]),'\n')
+cat("The effective size for tau_o_pos is",effectiveSize(model_samples[[1]][,"tau_o_pos"]), '\n')
+cat("The effective size for tau_o_pos is",effectiveSize(model_samples[[1]][,"tau_o_vel"]), '\n')
+cat("The effective size for wx is",effectiveSize(model_samples[[1]][,"wx"]), '\n')
+cat("The effective size for wy is",effectiveSize(model_samples[[1]][,"wy"]), '\n')
+cat("The effective size for wy is",effectiveSize(model_samples[[1]][,"wz"]), '\n')
+```
+The below code block shows the summary for the sampling done by Model 1 from above.
+
+```{r Model 1: Summary Statistics }
+summary(model_samples)
+```
+The below code block shows the plot of angular velocities from the modelling output from sampling done on Model 1.
+
+```{r Model 1: Posterior Plot of Angular Velocity}
+plot(model_samples[,c('wx','wy','wz')])
+```
+
+## Question 3 - Posterior predictive checks on the previous Euler-Mayurama model. 
+
+In this question, I perform posterior predictive checks on the Model 1 from above. The reason why posterior predictive checks are necessary are:
+
+1. Generate simulated data and check if the generated dataset has same size and structure as dataset (observed).
+2. Validate consistency - check for patterns in the observed and generated dataset, perform tests like studentised residual test (for linear regression, not applicable here), replicate checks etc. to investigate inconsistencies.
+
+```{r Model 1: Samples for replicate stochastic variables(position and variables) for posterior predictive checks (replicate checks) }
+model_samples2 <- coda.samples(model, variable.names = c('xrep', 'yrep', 'zrep', 'vxrep', 'vyrep', 'vzrep'), n.iter = niter) #Get the samples for the replicated values for position and velocity
+```
+The below code block extracts all stochastic values in matrix format for downstream usage in plotting graphs to validate consistency.
+
+```{r Model 2: Extracting all replicate stochastic variables }
+require(fBasics)
+
+#Extract all the stochastic variables in usable format - matrix notation
+xrep <- yrep <- zrep <- vxrep <- vyrep <- vzrep <- matrix(NA,nrow=niter,ncol=(n-1))
+for(i in 1:(n-1)){
+  xrep[,i] <- model_samples2[[1]][,paste0('xrep[',i+1,']')]
+  yrep[,i] <- model_samples2[[1]][,paste0('yrep[',i+1,']')]
+  zrep[,i] <- model_samples2[[1]][,paste0('zrep[',i+1,']')]
+  vxrep[,i] <- model_samples2[[1]][,paste0('vxrep[',i+1,']')]
+  vyrep[,i] <- model_samples2[[1]][,paste0('vyrep[',i+1,']')]
+  vzrep[,i] <- model_samples2[[1]][,paste0('vzrep[',i+1,']')]
+}
+```
+
+The below code block demonstrates graphs for posterior predictive checks for position(x). There are 5 test graphs which validate certain aspects of the model:
+
+1. Mean - Shows how the concentration of simulated data from the model matches with the original data.
+2. Min and Max - Shows the range of simulated data compared to observed data.
+3. Median - This parameter compares the central tendency of the simulated data with the observed data.
+4. Mode (for discrete or multimodal distributions) - This parameter demonstrates the representation of multiple modes in simulated data compared to observed data. Inconsistency between observed and simulated modes highlights issues in the modelling.
+5. Skewness - The skewness for simulated and observed data should match for consistency.
+6. Kurtosis - Kurtosis is used to check for the tail information of the simulated data compared to observed data. It is an enhancement over the Skewness as it highlights the extent of skewness.
+
+For position x as shown below, it makes sense to compare min, max(range), skewness and kurtosis(to compare skewness and extent of skewness).
+
+```{r Model 2: Posterior Predictive Checks - Position x }
+hist(apply(xrep,1,min), col="gray40")
+abline(v=min(xo), col="red", lwd=2)
+
+hist(apply(xrep,1,max), col="gray40")
+abline(v=max(xo), col="red", lwd=2)
+
+hist(apply(xrep,1,skewness), col="gray40")
+abline(v=skewness(xo), col="red", lwd=2)
+
+hist(apply(xrep,1,kurtosis), col="gray40")
+abline(v=kurtosis(xo), col="red", lwd=2)
+```
+For position y as shown below, it makes sense to compare min, max(range), skewness and kurtosis(to compare skewness and extent of skewness).
+
+```{r Model 2: Posterior Predictive Checks - Position y}
+hist(apply(yrep,1,min), col="gray40")
+abline(v=min(yo), col="red", lwd=2)
+
+hist(apply(yrep,1,max), col="gray40")
+abline(v=max(yo), col="red", lwd=2)
+
+hist(apply(yrep,1,skewness), col="gray40")
+abline(v=skewness(yo), col="red", lwd=2)
+
+hist(apply(yrep,1,kurtosis), col="gray40")
+abline(v=kurtosis(yo), col="red", lwd=2)
+```
+For position z as shown below, it makes sense to compare min, max(range and outliers), skewness and kurtosis(to compare skewness and extent of skewness).
+
+```{r Model 2: Posterior Predictive Checks - Position z }
+hist(apply(zrep,1,min), col="gray40")
+abline(v=min(zo), col="red", lwd=2)
+
+hist(apply(zrep,1,max), col="gray40")
+abline(v=max(zo), col="red", lwd=2)
+
+hist(apply(zrep,1,skewness), col="gray40")
+abline(v=skewness(zo), col="red", lwd=2)
+
+hist(apply(zrep,1,kurtosis), col="gray40")
+abline(v=kurtosis(zo), col="red", lwd=2)
+```
+For velocity vx as shown below, it makes sense to compare min, max(range), median(to check if the simulated data velocities are typical to that of a ping-pong ball), skewness and kurtosis(to compare skewness and extent of skewness).
+
+```{r Model 2: Posterior Predictive Checks - Velocity vx }
+hist(apply(vxrep,1,min), col="gray40")
+abline(v=min(vxo), col="red", lwd=2)
+
+hist(apply(vxrep,1,max), col="gray40")
+abline(v=max(vxo), col="red", lwd=2)
+
+hist(apply(vxrep,1,median), col="gray40")
+abline(v=median(vxo), col="red", lwd=2)
+
+hist(apply(vxrep,1,skewness), col="gray40")
+abline(v=skewness(vxo), col="red", lwd=2)
+
+hist(apply(vxrep,1,kurtosis), col="gray40")
+abline(v=kurtosis(vxo), col="red", lwd=2)
+```
+For velocity vy as shown below, it makes sense to compare min, max(range), median(to check if the simulated data velocities are typical to that of a ping-pong ball), skewness and kurtosis(to compare skewness and extent of skewness).
+
+```{r Model 2: Posterior Predictive Checks - Velocity vy }
+hist(apply(vyrep,1,min), col="gray40")
+abline(v=min(vyo), col="red", lwd=2)
+
+hist(apply(vyrep,1,max), col="gray40")
+abline(v=max(vyo), col="red", lwd=2)
+
+hist(apply(vyrep,1,median), col="gray40")
+abline(v=median(vyo), col="red", lwd=2)
+
+hist(apply(vyrep,1,skewness), col="gray40")
+abline(v=skewness(vyo), col="red", lwd=2)
+
+hist(apply(vyrep,1,kurtosis), col="gray40")
+abline(v=kurtosis(vyo), col="red", lwd=2)
+```
+For velocity vz as shown below, it makes sense to compare min, max(range), median(to check if the simulated data velocities are typical to that of a ping-pong ball), skewness and kurtosis(to compare skewness and extent of skewness).
+
+```{r Model 2: Posterior Predictive Checks - Velocity vz}
+hist(apply(vzrep,1,min), col="gray40")
+abline(v=min(vzo), col="red", lwd=2)
+
+hist(apply(vzrep,1,max), col="gray40")
+abline(v=max(vzo), col="red", lwd=2)
+
+hist(apply(vzrep,1,median), col="gray40")
+abline(v=median(vzo), col="red", lwd=2)
+
+hist(apply(vzrep,1,skewness), col="gray40")
+abline(v=skewness(vzo), col="red", lwd=2)
+
+hist(apply(vzrep,1,kurtosis), col="gray40")
+abline(v=kurtosis(vzo), col="red", lwd=2)
+```
+### Plotting x vs z graph for the posterior predictive output from Model 1.
+
+```{r Model 1: Plotting x vs z graph for posterior predictive output }
+plot(density(xrep[1,]),col="lightskyblue1",ylim=c(0,0.1))
+for(i in 2:1000){
+lines(density(xrep[i,]),col="lightskyblue1")  
+}
+lines(density(xo),col="black",lwd=4)
+
+plot(density(zrep[1,]),col="lightskyblue1",ylim=c(0,0.1))
+for(i in 2:1000){
+lines(density(zrep[i,]),col="lightskyblue1")  
+}
+lines(density(zo),col="black",lwd=4)
+```
+
+## Question 4 - Predict the trajectory for the next 6 time steps
+
+The below code block gets the observed data for 66 timesteps.
+
+```{r Model 1: Predict the trajectory for the next 6 time steps}
+#Read position and velocity for 66 timesteps.
+xyz.obs.p<-h5read("MN5008_grid_data_equal_speeds.hdf5","/originals/405/positions")[,2:(66+1)];
+xo.p=xyz.obs.p[1,]; yo.p=xyz.obs.p[2,]; zo.p=xyz.obs.p[3,];
+vxvyvz.obs.p<-h5read("MN5008_grid_data_equal_speeds.hdf5","/originals/405/velocities")[,2:(66+1)];
+vxo.p<-vxvyvz.obs.p[1,]; vyo.p=vxvyvz.obs.p[2,]; vzo.p=vxvyvz.obs.p[3,];
+timeSteps.p<-h5read("MN5008_grid_data_equal_speeds.hdf5","/originals/405/time_stamps")[2:(66+1)];
+
+xo.p.orig <- xyz.obs.p[1,]
+yo.p.orig <- xyz.obs.p[2,]
+zo.p.orig <- xyz.obs.p[3,]
+vxo.p.orig <- vxvyvz.obs.p[1,]
+vyo.p.orig <- vxvyvz.obs.p[2,]
+vzo.p.orig <- vxvyvz.obs.p[3,]
+
+```
+
+In the below code block, the position and velocity values are masked for the next 6 values(61 to 66) for posterior prediction, extracted from the model to get posterior values, then get the mean as predicted value.
+
+```{r Model 1: Mask the data for last 6 timesteps }
+for(i in 61:66){
+  xo.p[i] <- NA
+  yo.p[i] <- NA 
+  zo.p[i] <- NA  
+  vxo.p[i] <- NA
+  vyo.p[i] <- NA 
+  vzo.p[i] <- NA  
+}
+```
+
+```{r Model 1: Store the variables to be extracted - positions x,y,z and vx,vy,vz}
+variables.p.x <- sapply(61:66, function(i) paste0('x[',i,']'))
+variables.p.y <- sapply(61:66, function(i) paste0('y[',i,']'))
+variables.p.z <- sapply(61:66, function(i) paste0('z[',i,']'))
+variables.p.vx <- sapply(61:66, function(i) paste0('vx[',i,']'))
+variables.p.vy <- sapply(61:66, function(i) paste0('vy[',i,']'))
+variables.p.vz <- sapply(61:66, function(i) paste0('vz[',i,']'))
+variables.p <- c(variables.p.x, variables.p.y, variables.p.z, variables.p.vx, variables.p.vy, variables.p.vz)
+```
+
+```{r Model 1: New posterior model for prediction}
+model.p <- jags.model(textConnection(model_string), data = list(
+  n=n+6,
+  xo=xo.p,
+  yo=yo.p,
+  zo=zo.p,
+  vxo=vxo.p,
+  vyo=vyo.p,
+  vzo=vzo.p,
+  delta = diff(timeSteps.p),
+  g=9.81,
+  km=1/(2*0.0027)*1*1.29*0.001256*0.02,
+  kd=-1/(2*0.0027)*0.456*1.29*0.001256
+), n.chains = 4)
+model_samples.p <- coda.samples(model.p, variable.names = variables.p, n.iter = niter)
+```
+```{r}
+x.p <- colMeans(as.matrix(model_samples.p[,variables.p.x]))
+y.p <- colMeans(as.matrix(model_samples.p[,variables.p.y]))
+z.p <- colMeans(as.matrix(model_samples.p[,variables.p.z]))
+vx.p <- colMeans(as.matrix(model_samples.p[,variables.p.vx]))
+vy.p <- colMeans(as.matrix(model_samples.p[,variables.p.vy]))
+vz.p <- colMeans(as.matrix(model_samples.p[,variables.p.vz]))
+```
+
+The below code block shows the Euclidean distance as a measure goodness-of-fit between each time step.
+
+```{r euclidean distance}
+pos.euclidean_distance <- rep(0, 6)
+for(i in 61:66){
+  pos.euclidean_distance[i-60] <- sqrt((xo.p.orig[i] - x.p[paste0('x[',i,']')])^2 + (yo.p.orig[i] - y.p[paste0('y[',i,']')])^2 + (zo.p.orig[i] - z.p[paste0('z[',i,']')])^2)
+}
+
+cat("The euclidean distance for Model 1 for 61 to 66 are", pos.euclidean_distance, '\n')
+```
+
+## Question 5 - Using Euler-Heun Method as enhancement over the Euler-Mayurama discretisation scheme
+
+My motivation for choosing Euler-Heun method is improved accuracy due to second ordered nature and intermediate step, and convergence more stable then Euler-Mayurama discretisation. Even though it is computationally expensive due to intermediate step calculations, the accuracy and convergence stability is achieved.
+
+```{r}
+model2_string <- "
+model {
+  # Given priors for position and velocity
+  x[1] ~ dnorm(0,1)
+  y[1] ~ dnorm(0,1)
+  z[1] ~ dnorm(0,1)
+  vx[1] ~ dnorm(0,25)
+  vy[1] ~ dnorm(0,25)
+  vz[1] ~ dnorm(0,25)
+  vx_star[1] ~ dnorm(0,25)
+  vy_star[1] ~ dnorm(0,25)
+  vz_star[1] ~ dnorm(0,25)
+  
+  # Custom Priors for precision and angular velocity
+  tau_pos ~ dgamma(1,0.5)
+  tau_vel ~ dgamma(1,0.5)
+  tau_o_pos ~ dgamma(1,0.5)
+  tau_o_vel ~ dgamma(1,0.5)
+  wx ~ dnorm(0,100)
+  wy ~ dnorm(0,100)
+  wz ~ dnorm(0,100)
+
+  # Likelihood
+  for (k in 1:(n-1)) {
+    vnorm[k] <- sqrt(vx[k]^2 + vy[k]^2 + vz[k]^2)
+    
+    x[k+1] ~ dnorm(x[k] + (vx[k] * delta[k]), tau_pos)  # Euler-Mayurama for x-coordinate
+    y[k+1] ~ dnorm(y[k] + (vy[k] * delta[k]), tau_pos)  # Euler-Mayurama for y-coordinate
+    z[k+1] ~ dnorm(z[k] + (vz[k] * delta[k]), tau_pos)  # Euler-Mayurama for z-coordinate
+    
+    vx_star[k+1] ~ dnorm(vx[k] + (kd * vnorm[k] * vx[k] + km * (wy * vz[k] - wz * vy[k])) * delta[k], tau_vel)  #Euler-Mayurama for vx
+    vy_star[k+1] ~ dnorm(vy[k] + (kd * vnorm[k] * vy[k] + km * (wz * vx[k] - wx * vz[k])) * delta[k], tau_vel)  #Euler-Mayurama for vy
+    vz_star[k+1] ~ dnorm(vz[k] + (kd * vnorm[k] * vz[k] + km * (wx * vy[k] - wy * vx[k])) * delta[k] - g * delta[k], tau_vel)  # Euler-Mayurama for vz
+    
+    vnorm_star[k] <- sqrt(vx_star[k]^2 + vy_star[k]^2 + vz_star[k]^2)
+    
+    vx[k+1] ~ dnorm(vx[k] + delta[k]/2*(kd * vnorm[k] * vx[k] + km * (wy * vz[k] - wz * vy[k]) + kd * vnorm_star[k] * vx_star[k] + km * (wy * vz_star[k] - wz * vy_star[k])), tau_vel)
+    vy[k+1] ~ dnorm(vy[k] + delta[k]/2*(kd * vnorm[k] * vy[k] + km * (wz * vx[k] - wx * vz[k]) + kd * vnorm_star[k] * vy_star[k] + km * (wz * vx_star[k] - wx * vz_star[k])), tau_vel)  #Euler-Mayurama for vy
+    vz[k+1] ~ dnorm(vz[k] + delta[k]/2*(kd * vnorm[k] * vz[k] + km * (wx * vy[k] - wy * vx[k]) + kd * vnorm[k] * vz_star[k] + km * (wx * vy_star[k] - wy * vx_star[k]) - 2*g), tau_vel)  # Euler-Mayurama for vz
+    
+    # posterior predictive checks use
+    xrep[k+1] ~ dnorm(x[k] + (vx[k] * delta[k]), tau_pos)  # Euler-Mayurama for x-coordinate
+    yrep[k+1] ~ dnorm(y[k] + (vy[k] * delta[k]), tau_pos)  # Euler-Mayurama for y-coordinate
+    zrep[k+1] ~ dnorm(z[k] + (vz[k] * delta[k]), tau_pos)  # Euler-Mayurama for z-coordinate
+    
+    vxrep[k+1] ~ dnorm(vx[k] + delta[k]/2*(kd * vnorm[k] * vx[k] + km * (wy * vz[k] - wz * vy[k]) + kd * vnorm_star[k] * vx_star[k] + km * (wy * vz_star[k] - wz * vy_star[k])), tau_vel)
+    vyrep[k+1] ~ dnorm(vy[k] + delta[k]/2*(kd * vnorm[k] * vy[k] + km * (wz * vx[k] - wx * vz[k]) + kd * vnorm_star[k] * vy_star[k] + km * (wz * vx_star[k] - wx * vz_star[k])), tau_vel)  #Euler-Mayurama for vy
+    vzrep[k+1] ~ dnorm(vz[k] + delta[k]/2*(kd * vnorm[k] * vz[k] + km * (wx * vy[k] - wy * vx[k]) + kd * vnorm[k] * vz_star[k] + km * (wx * vy_star[k] - wy * vx_star[k]) - 2*g), tau_vel)  # Euler-Mayurama for vz
+  }
+  
+  # observation model
+  for(k in 1:(n-1)){
+    xo[k] ~ dnorm(x[k],tau_o_pos)
+    yo[k] ~ dnorm(y[k],tau_o_pos)
+    zo[k] ~ dnorm(z[k],tau_o_pos)
+    vxo[k] ~ dnorm(vx[k],tau_o_vel)
+    vyo[k] ~ dnorm(vy[k],tau_o_vel)
+    vzo[k] ~ dnorm(vz[k],tau_o_vel)
+  }
+}
+"
+```
+
+```{r}
+model_heun <- jags.model(textConnection(model2_string), data = list(
+  n=n,
+  xo=xo,
+  yo=yo,
+  zo=zo,
+  vxo=vxo,
+  vyo=vyo,
+  vzo=vzo,
+  delta = diff(timeSteps),
+  g=9.81,
+  km=1/(2*0.0027)*1*1.29*0.001256*0.02,
+  kd=-1/(2*0.0027)*0.456*1.29*0.001256
+), n.chains = 4)
+
+# Update model
+update(model_heun, 1000)
+
+# Sampling
+model_samples_heun <- coda.samples(model_heun, variable.names = c('tau_pos', 'tau_vel', 'tau_o_pos', 'tau_o_vel', 'wx', 'wy', 'wz', 'xrep', 'yrep', 'zrep', 'vxrep', 'vyrep', 'vzrep'), n.iter = niter)
+```
+```{r Model Heun: Effective sample sizes, posterior predictive checks and predictive performance on next 6 values}
+cat("The effective size for tau_pos is", effectiveSize(model_samples_heun[[1]][,"tau_pos"]),'\n')
+cat("The effective size for tau_vel is", effectiveSize(model_samples_heun[[1]][,"tau_vel"]),'\n')
+cat("The effective size for tau_o_pos is", effectiveSize(model_samples_heun[[1]][,"tau_o_pos"]), '\n')
+cat("The effective size for tau_o_vel is", effectiveSize(model_samples_heun[[1]][,"tau_o_vel"]), '\n')
+cat("The effective size for wx is", effectiveSize(model_samples_heun[[1]][,"wx"]), '\n')
+cat("The effective size for wy is", effectiveSize(model_samples_heun[[1]][,"wy"]), '\n')
+cat("The effective size for wz is", effectiveSize(model_samples_heun[[1]][,"wz"]), '\n')
+```
+
+```{r Posterior predictive checks}
+#model_samples_heun2 <- coda.samples(model_heun, variable.names = c('xrep', 'yrep', 'zrep', 'vxrep', 'vyrep', 'vzrep'), n.iter = niter) #Get the samples for the replicated values for position and velocity
+
+require(fBasics)
+
+#Extract all the stochastic variables in usable format - matrix notation
+xrep <- yrep <- zrep <- vxrep <- vyrep <- vzrep <- matrix(NA,nrow=niter,ncol=(n-1))
+for(i in 1:(n-1)){
+  xrep[,i] <- model_samples_heun[[1]][,paste0('xrep[',i+1,']')]
+  yrep[,i] <- model_samples_heun[[1]][,paste0('yrep[',i+1,']')]
+  zrep[,i] <- model_samples_heun[[1]][,paste0('zrep[',i+1,']')]
+  vxrep[,i] <- model_samples_heun[[1]][,paste0('vxrep[',i+1,']')]
+  vyrep[,i] <- model_samples_heun[[1]][,paste0('vyrep[',i+1,']')]
+  vzrep[,i] <- model_samples_heun[[1]][,paste0('vzrep[',i+1,']')]
+}
+
+hist(apply(xrep,1,min), col="gray40")
+abline(v=min(xo), col="red", lwd=2)
+
+hist(apply(xrep,1,max), col="gray40")
+abline(v=max(xo), col="red", lwd=2)
+
+hist(apply(xrep,1,skewness), col="gray40")
+abline(v=skewness(xo), col="red", lwd=2)
+
+hist(apply(xrep,1,kurtosis), col="gray40")
+abline(v=kurtosis(xo), col="red", lwd=2)
+
+hist(apply(yrep,1,min), col="gray40")
+abline(v=min(yo), col="red", lwd=2)
+
+hist(apply(yrep,1,max), col="gray40")
+abline(v=max(yo), col="red", lwd=2)
+
+hist(apply(yrep,1,skewness), col="gray40")
+abline(v=skewness(yo), col="red", lwd=2)
+
+hist(apply(yrep,1,kurtosis), col="gray40")
+abline(v=kurtosis(yo), col="red", lwd=2)
+
+hist(apply(zrep,1,min), col="gray40")
+abline(v=min(zo), col="red", lwd=2)
+
+hist(apply(zrep,1,max), col="gray40")
+abline(v=max(zo), col="red", lwd=2)
+
+hist(apply(zrep,1,skewness), col="gray40")
+abline(v=skewness(zo), col="red", lwd=2)
+
+hist(apply(zrep,1,kurtosis), col="gray40")
+abline(v=kurtosis(zo), col="red", lwd=2)
+
+hist(apply(vxrep,1,min), col="gray40")
+abline(v=min(vxo), col="red", lwd=2)
+
+hist(apply(vxrep,1,max), col="gray40")
+abline(v=max(vxo), col="red", lwd=2)
+
+hist(apply(vxrep,1,median), col="gray40")
+abline(v=median(vxo), col="red", lwd=2)
+
+hist(apply(vxrep,1,skewness), col="gray40")
+abline(v=skewness(vxo), col="red", lwd=2)
+
+hist(apply(vxrep,1,kurtosis), col="gray40")
+abline(v=kurtosis(vxo), col="red", lwd=2)
+
+hist(apply(vyrep,1,min), col="gray40")
+abline(v=min(vyo), col="red", lwd=2)
+
+hist(apply(vyrep,1,max), col="gray40")
+abline(v=max(vyo), col="red", lwd=2)
+
+hist(apply(vyrep,1,median), col="gray40")
+abline(v=median(vyo), col="red", lwd=2)
+
+hist(apply(vyrep,1,skewness), col="gray40")
+abline(v=skewness(vyo), col="red", lwd=2)
+
+hist(apply(vyrep,1,kurtosis), col="gray40")
+abline(v=kurtosis(vyo), col="red", lwd=2)
+
+hist(apply(vzrep,1,min), col="gray40")
+abline(v=min(vzo), col="red", lwd=2)
+
+hist(apply(vzrep,1,max), col="gray40")
+abline(v=max(vzo), col="red", lwd=2)
+
+hist(apply(vzrep,1,median), col="gray40")
+abline(v=median(vzo), col="red", lwd=2)
+
+hist(apply(vzrep,1,skewness), col="gray40")
+abline(v=skewness(vzo), col="red", lwd=2)
+
+hist(apply(vzrep,1,kurtosis), col="gray40")
+abline(v=kurtosis(vzo), col="red", lwd=2)
+```
+
+```{r Prediction on next 6 values}
+#Read position and velocity for 66 timesteps.
+xyz.obs.p<-h5read("MN5008_grid_data_equal_speeds.hdf5","/originals/405/positions")[,2:(66+1)];
+xo.p=xyz.obs.p[1,]; yo.p=xyz.obs.p[2,]; zo.p=xyz.obs.p[3,];
+vxvyvz.obs.p<-h5read("MN5008_grid_data_equal_speeds.hdf5","/originals/405/velocities")[,2:(66+1)];
+vxo.p<-vxvyvz.obs.p[1,]; vyo.p=vxvyvz.obs.p[2,]; vzo.p=vxvyvz.obs.p[3,];
+timeSteps.p<-h5read("MN5008_grid_data_equal_speeds.hdf5","/originals/405/time_stamps")[2:(66+1)];
+
+xo.p.orig <- xyz.obs.p[1,]
+yo.p.orig <- xyz.obs.p[2,]
+zo.p.orig <- xyz.obs.p[3,]
+vxo.p.orig <- vxvyvz.obs.p[1,]
+vyo.p.orig <- vxvyvz.obs.p[2,]
+vzo.p.orig <- vxvyvz.obs.p[3,]
+
+for(i in 61:66){
+  xo.p[i] <- NA
+  yo.p[i] <- NA 
+  zo.p[i] <- NA  
+  vxo.p[i] <- NA
+  vyo.p[i] <- NA 
+  vzo.p[i] <- NA  
+}
+
+variables.p.x <- sapply(61:66, function(i) paste0('x[',i,']'))
+variables.p.y <- sapply(61:66, function(i) paste0('y[',i,']'))
+variables.p.z <- sapply(61:66, function(i) paste0('z[',i,']'))
+variables.p.vx <- sapply(61:66, function(i) paste0('vx[',i,']'))
+variables.p.vy <- sapply(61:66, function(i) paste0('vy[',i,']'))
+variables.p.vz <- sapply(61:66, function(i) paste0('vz[',i,']'))
+variables.p <- c(variables.p.x, variables.p.y, variables.p.z, variables.p.vx, variables.p.vy, variables.p.vz)
+
+model.p <- jags.model(textConnection(model_string), data = list(
+  n=n+6,
+  xo=xo.p,
+  yo=yo.p,
+  zo=zo.p,
+  vxo=vxo.p,
+  vyo=vyo.p,
+  vzo=vzo.p,
+  delta = diff(timeSteps.p),
+  g=9.81,
+  km=1/(2*0.0027)*1*1.29*0.001256*0.02,
+  kd=-1/(2*0.0027)*0.456*1.29*0.001256
+), n.chains = 4)
+model_samples.p <- coda.samples(model.p, variable.names = variables.p, n.iter = niter)
+
+x.p <- colMeans(as.matrix(model_samples.p[,variables.p.x]))
+y.p <- colMeans(as.matrix(model_samples.p[,variables.p.y]))
+z.p <- colMeans(as.matrix(model_samples.p[,variables.p.z]))
+vx.p <- colMeans(as.matrix(model_samples.p[,variables.p.vx]))
+vy.p <- colMeans(as.matrix(model_samples.p[,variables.p.vy]))
+vz.p <- colMeans(as.matrix(model_samples.p[,variables.p.vz]))
+
+pos.euclidean_distance <- rep(0, 6)
+for(i in 61:66){
+  pos.euclidean_distance[i-60] <- sqrt((xo.p.orig[i] - x.p[paste0('x[',i,']')])^2 + (yo.p.orig[i] - y.p[paste0('y[',i,']')])^2 + (zo.p.orig[i] - z.p[paste0('z[',i,']')])^2)
+}
+
+cat("The Euclidean distance for Euler-Heun model for time steps 61 to 66 are", pos.euclidean_distance, "\n")
+```
